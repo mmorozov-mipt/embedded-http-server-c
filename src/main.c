@@ -1,193 +1,162 @@
 #include <stdio.h>
-#include <string.h>
 #include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
-#ifdef _WIN32
-    #include <winsock2.h>
-    #include <ws2tcpip.h>
-    #pragma comment(lib, "ws2_32.lib")
-#else
-    #include <unistd.h>
-    #include <arpa/inet.h>
-    #include <sys/socket.h>
-    #include <netinet/in.h>
-#endif
+#define PORT 8080
+#define RECV_BUFFER_SIZE 4096
 
-#define SERVER_PORT 8080
-#define BUFFER_SIZE 2048
-
-/* Простые "статические файлы", зашитые в прошивку */
-
-static const char INDEX_HTML[] =
-    "<!DOCTYPE html>\n"
-    "<html>\n"
-    "<head>\n"
-    "  <meta charset=\"utf-8\">\n"
-    "  <title>Embedded HTTP server</title>\n"
-    "  <link rel=\"stylesheet\" href=\"/style.css\">\n"
-    "</head>\n"
-    "<body>\n"
-    "  <h1>HTTP server in C</h1>\n"
-    "  <p>This page is served as a static resource from a simple single threaded server.</p>\n"
-    "  <p>Try <a href=\"/image\">/image</a> to see binary content response.</p>\n"
-    "</body>\n"
-    "</html>\n";
-
-static const char STYLE_CSS[] =
-    "body { font-family: Arial, sans-serif; background: #f5f5f5; }\n"
-    "h1 { color: #333; }\n"
-    "a { color: #007acc; }\n";
-
-/* Просто заглушка под бинарный контент, по сути это просто байты */
-static const unsigned char IMAGE_DATA[] = {
-    0x47, 0x49, 0x46, 0x38, 0x39, 0x61, /* GIF89a header */
-    0x01, 0x00, 0x01, 0x00,
-    0x80, 0x00, 0x00,
-    0xff, 0xff, 0xff, 0x00, 0x00, 0x00,
-    0x21, 0xf9, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00,
-    0x2c, 0x00, 0x00, 0x00, 0x00,
-    0x01, 0x00, 0x01, 0x00,
-    0x00, 0x02, 0x02, 0x44, 0x01, 0x00, 0x3b
-};
-static const size_t IMAGE_DATA_SIZE = sizeof(IMAGE_DATA);
-
-/* Отправка простого HTTP ответа со строковым телом */
-
-void send_text_response(int client_fd,
-                        const char *status_line,
-                        const char *content_type,
-                        const char *body)
+static void send_response(int client_fd,
+                          const char *status,
+                          const char *content_type,
+                          const void *body,
+                          size_t body_len)
 {
     char header[512];
-    size_t body_len = strlen(body);
-
     int header_len = snprintf(
         header,
         sizeof(header),
-        "%s\r\n"
+        "HTTP/1.1 %s\r\n"
         "Content-Type: %s\r\n"
         "Content-Length: %zu\r\n"
         "Connection: close\r\n"
         "\r\n",
-        status_line,
+        status,
         content_type,
         body_len
     );
 
-#ifdef _WIN32
-    send(client_fd, header, header_len, 0);
-    send(client_fd, body, (int)body_len, 0);
-#else
     write(client_fd, header, header_len);
-    write(client_fd, body, body_len);
-#endif
+
+    if (body && body_len > 0) {
+        write(client_fd, body, body_len);
+    }
 }
 
-/* Отправка бинарного ответа */
-
-void send_binary_response(int client_fd,
-                          const char *status_line,
-                          const char *content_type,
-                          const unsigned char *data,
-                          size_t data_len)
+static void handle_root(int client_fd)
 {
-    char header[512];
+    const char *html =
+        "<!doctype html>"
+        "<html><head><meta charset=\"utf-8\"><title>HTTP server in C</title></head>"
+        "<body>"
+        "<h1>Embedded HTTP server in C</h1>"
+        "<p>This page is served as a static response from a simple single threaded server.</p>"
+        "<ul>"
+        "<li><a href=\"/file\">Text file example</a></li>"
+        "<li><a href=\"/image\">Image example</a></li>"
+        "</ul>"
+        "</body></html>";
 
-    int header_len = snprintf(
-        header,
-        sizeof(header),
-        "%s\r\n"
-        "Content-Type: %s\r\n"
-        "Content-Length: %zu\r\n"
-        "Connection: close\r\n"
-        "\r\n",
-        status_line,
-        content_type,
-        data_len
-    );
-
-#ifdef _WIN32
-    send(client_fd, header, header_len, 0);
-    send(client_fd, (const char *)data, (int)data_len, 0);
-#else
-    write(client_fd, header, header_len);
-    write(client_fd, data, data_len);
-#endif
+    send_response(client_fd, "200 OK", "text/html; charset=utf-8",
+                  html, strlen(html));
 }
 
-/* Очень простой разбор HTTP запроса, смотрим только первую строку */
-
-void handle_client(int client_fd)
+static void handle_text_file(int client_fd)
 {
-    char buffer[BUFFER_SIZE];
-#ifdef _WIN32
-    int received = recv(client_fd, buffer, BUFFER_SIZE - 1, 0);
-#else
-    int received = (int)read(client_fd, buffer, BUFFER_SIZE - 1);
-#endif
+    const char *text =
+        "This is a static text response from C HTTP server.\n"
+        "It simulates serving a small text file with Content-Type: text/plain.\n";
 
+    send_response(client_fd, "200 OK", "text/plain; charset=utf-8",
+                  text, strlen(text));
+}
+
+static void handle_image(int client_fd)
+{
+    const char *image_path = "assets/example.png";
+    FILE *f = fopen(image_path, "rb");
+    if (!f) {
+        const char *msg = "Image not found\n";
+        send_response(client_fd, "404 Not Found", "text/plain; charset=utf-8",
+                      msg, strlen(msg));
+        return;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if (size <= 0) {
+        fclose(f);
+        const char *msg = "Empty image file\n";
+        send_response(client_fd, "500 Internal Server Error", "text/plain; charset=utf-8",
+                      msg, strlen(msg));
+        return;
+    }
+
+    char *buffer = (char *)malloc((size_t)size);
+    if (!buffer) {
+        fclose(f);
+        const char *msg = "Memory allocation failed\n";
+        send_response(client_fd, "500 Internal Server Error", "text/plain; charset=utf-8",
+                      msg, strlen(msg));
+        return;
+    }
+
+    size_t read_bytes = fread(buffer, 1, (size_t)size, f);
+    fclose(f);
+
+    if (read_bytes != (size_t)size) {
+        free(buffer);
+        const char *msg = "Failed to read image file\n";
+        send_response(client_fd, "500 Internal Server Error", "text/plain; charset=utf-8",
+                      msg, strlen(msg));
+        return;
+    }
+
+    send_response(client_fd, "200 OK", "image/png", buffer, (size_t)size);
+    free(buffer);
+}
+
+static void handle_client(int client_fd)
+{
+    char buffer[RECV_BUFFER_SIZE];
+    ssize_t received = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
     if (received <= 0) {
+        close(client_fd);
         return;
     }
 
     buffer[received] = '\0';
 
-    /* Ожидаем что первая строка формата: GET /path HTTP/1.1 */
-    char method[8] = {0};
-    char path[256] = {0};
-
+    char method[8];
+    char path[256];
     if (sscanf(buffer, "%7s %255s", method, path) != 2) {
-        send_text_response(client_fd,
-                           "HTTP/1.1 400 Bad Request",
-                           "text/plain; charset=utf-8",
-                           "Bad Request\n");
+        const char *msg = "Bad request\n";
+        send_response(client_fd, "400 Bad Request", "text/plain; charset=utf-8",
+                      msg, strlen(msg));
+        close(client_fd);
         return;
     }
 
     if (strcmp(method, "GET") != 0) {
-        send_text_response(client_fd,
-                           "HTTP/1.1 405 Method Not Allowed",
-                           "text/plain; charset=utf-8",
-                           "Only GET is supported\n");
+        const char *msg = "Only GET is supported\n";
+        send_response(client_fd, "405 Method Not Allowed", "text/plain; charset=utf-8",
+                      msg, strlen(msg));
+        close(client_fd);
         return;
     }
 
-    if (strcmp(path, "/") == 0 || strcmp(path, "/index.html") == 0) {
-        send_text_response(client_fd,
-                           "HTTP/1.1 200 OK",
-                           "text/html; charset=utf-8",
-                           INDEX_HTML);
-    } else if (strcmp(path, "/style.css") == 0) {
-        send_text_response(client_fd,
-                           "HTTP/1.1 200 OK",
-                           "text/css; charset=utf-8",
-                           STYLE_CSS);
+    if (strcmp(path, "/") == 0) {
+        handle_root(client_fd);
+    } else if (strcmp(path, "/file") == 0) {
+        handle_text_file(client_fd);
     } else if (strcmp(path, "/image") == 0) {
-        send_binary_response(client_fd,
-                             "HTTP/1.1 200 OK",
-                             "image/gif",
-                             IMAGE_DATA,
-                             IMAGE_DATA_SIZE);
+        handle_image(client_fd);
     } else {
-        const char *not_found =
-            "<html><body><h1>404 Not Found</h1></body></html>\n";
-        send_text_response(client_fd,
-                           "HTTP/1.1 404 Not Found",
-                           "text/html; charset=utf-8",
-                           not_found);
+        const char *msg = "Not found\n";
+        send_response(client_fd, "404 Not Found", "text/plain; charset=utf-8",
+                      msg, strlen(msg));
     }
+
+    close(client_fd);
 }
 
 int main(void)
 {
-#ifdef _WIN32
-    WSADATA wsaData;
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        fprintf(stderr, "WSAStartup failed\n");
-        return 1;
-    }
-#endif
-
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
         perror("socket failed");
@@ -195,67 +164,41 @@ int main(void)
     }
 
     int opt = 1;
-#ifdef _WIN32
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt, sizeof(opt));
-#else
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-#endif
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons(SERVER_PORT);
+    addr.sin_port = htons(PORT);
 
     if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("bind failed");
-#ifdef _WIN32
-        closesocket(server_fd);
-        WSACleanup();
-#else
         close(server_fd);
-#endif
         return 1;
     }
 
-    if (listen(server_fd, 4) < 0) {
+    if (listen(server_fd, 8) < 0) {
         perror("listen failed");
-#ifdef _WIN32
-        closesocket(server_fd);
-        WSACleanup();
-#else
         close(server_fd);
-#endif
         return 1;
     }
 
-    printf("HTTP server is listening on port %d\n", SERVER_PORT);
+    printf("HTTP server listening on port %d\n", PORT);
 
     while (1) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
-        int client_fd =
-            accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+
+        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
         if (client_fd < 0) {
             perror("accept failed");
             continue;
         }
 
         handle_client(client_fd);
-
-#ifdef _WIN32
-        closesocket(client_fd);
-#else
-        close(client_fd);
-#endif
     }
 
-#ifdef _WIN32
-    closesocket(server_fd);
-    WSACleanup();
-#else
     close(server_fd);
-#endif
-
     return 0;
 }
